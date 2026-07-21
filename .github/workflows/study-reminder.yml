@@ -1,0 +1,75 @@
+name: Study Reminder
+
+# Runs every hour, on the hour (UTC). Inside the job we check whether it's currently
+# 6-8pm in Auckland before doing anything — this auto-adjusts for daylight saving
+# without you needing to touch this file twice a year.
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  check-and-nudge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the time and nudge if you're behind
+        env:
+          NTFY_TOPIC_BASE: ${{ secrets.NTFY_TOPIC_BASE }}
+        run: |
+          set -e
+
+          if [ -z "$NTFY_TOPIC_BASE" ]; then
+            echo "NTFY_TOPIC_BASE secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          HOUR=$(TZ="Pacific/Auckland" date +%H)
+          TODAY=$(TZ="Pacific/Auckland" date +%Y-%m-%d)
+          echo "Auckland local hour: $HOUR"
+
+          # Nudge window is 18:00-19:59 Auckland time. Using a 2-hour window (not an
+          # exact hour) absorbs GitHub's occasional scheduling delays.
+          if [ "$HOUR" != "18" ] && [ "$HOUR" != "19" ]; then
+            echo "Not nudge time, skipping."
+            exit 0
+          fi
+
+          STATUS=$(curl -s "https://ntfy.sh/${NTFY_TOPIC_BASE}-status/json?poll=1&since=latest" | tail -n 1)
+          echo "Latest status payload: $STATUS"
+
+          MSG_DATE=$(echo "$STATUS" | jq -r '(.message | fromjson? // {}) | .date // empty' 2>/dev/null || echo "")
+          DUE=$(echo "$STATUS" | jq -r '(.message | fromjson? // {}) | .dueCount // empty' 2>/dev/null || echo "")
+
+          if [ "$MSG_DATE" == "$TODAY" ] && [ "$DUE" == "0" ]; then
+            echo "Already caught up today. No nudge needed."
+            exit 0
+          fi
+
+          # Only send one nudge per day: after sending, log a marker so later hourly
+          # runs today skip re-sending. We (ab)use the same status topic for this.
+          ALREADY_NUDGED=$(echo "$STATUS" | jq -r '(.message | fromjson? // {}) | .nudgedDate // empty' 2>/dev/null || echo "")
+          if [ "$ALREADY_NUDGED" == "$TODAY" ]; then
+            echo "Already nudged today. Skipping."
+            exit 0
+          fi
+
+          if [ "$MSG_DATE" == "$TODAY" ] && [ -n "$DUE" ]; then
+            BODY="You still have $DUE expression(s) due for review today. A few minutes now keeps the streak going."
+          else
+            BODY="You haven't opened Phrase Field Notes today yet. A quick review or one new expression keeps things moving."
+          fi
+
+          curl -s \
+            -H "Title: Phrase Field Notes" \
+            -H "Priority: high" \
+            -H "Tags: books" \
+            -d "$BODY" \
+            "https://ntfy.sh/${NTFY_TOPIC_BASE}-alerts"
+
+          # Mark that we've nudged today so this doesn't repeat every hour in the window.
+          curl -s \
+            -H "Content-Type: text/plain" \
+            -d "{\"date\":\"$MSG_DATE\",\"dueCount\":\"$DUE\",\"nudgedDate\":\"$TODAY\"}" \
+            "https://ntfy.sh/${NTFY_TOPIC_BASE}-status" > /dev/null
+
+          echo "Nudge sent."
